@@ -1,0 +1,135 @@
+name: Build desktop releases
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full source commit SHA to build
+        required: true
+        type: string
+      version:
+        description: Release tag, for example v0.1.0
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: desktop-release
+  cancel-in-progress: false
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: linux
+            bundles: deb,appimage
+          - os: windows-latest
+            platform: windows
+            bundles: nsis
+          - os: macos-15
+            platform: mac-arm
+            bundles: dmg
+          - os: macos-15-intel
+            platform: mac-intel
+            bundles: dmg
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      ODS_PUBLIC_KEYS: ${{ secrets.ODS_PUBLIC_KEYS }}
+      APPLE_SIGNING_IDENTITY: '-'
+      SOURCE_SHA: ${{ inputs.source_sha }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    steps:
+      - name: Validate source revision
+        working-directory: .
+        run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - name: Check out private source (read-only)
+        uses: actions/checkout@v4
+        with:
+          repository: AMANKUMAR7777/offline-ai-dataset-studio
+          ref: ${{ inputs.source_sha }}
+          ssh-key: ${{ secrets.ODS_SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: source
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.11.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - run: pnpm install --frozen-lockfile
+      - name: Test core and licenses
+        run: cargo test --locked -p studio-core -p license-core
+      - name: Build frontend
+        run: pnpm --filter @ods/desktop build
+      - name: Build installers
+        uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: source/apps/desktop
+          tauriScript: pnpm exec tauri
+          args: --bundles ${{ matrix.bundles }}
+      - name: Stage platform files
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          mkdir -p release-assets
+          case "$PLATFORM" in
+            linux)
+              deb=$(find target/release/bundle -type f -name '*.deb' -print -quit)
+              app=$(find target/release/bundle -type f -name '*.AppImage' -print -quit)
+              test -n "$deb" && test -n "$app"
+              cp "$deb" release-assets/ODS_0.1.0_amd64.deb
+              cp "$app" release-assets/ODS_0.1.0_amd64.AppImage
+              ;;
+            windows)
+              exe=$(find target/release/bundle -type f -iname '*setup.exe' -print -quit)
+              test -n "$exe"
+              cp "$exe" release-assets/ODS_0.1.0_x64-setup.exe
+              ;;
+            mac-arm|mac-intel)
+              dmg=$(find target/release/bundle -type f -name '*.dmg' -print -quit)
+              test -n "$dmg"
+              if [ "$PLATFORM" = mac-arm ]; then arch=aarch64; else arch=x64; fi
+              cp "$dmg" "release-assets/ODS_0.1.0_${arch}.dmg"
+              ;;
+          esac
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: source/release-assets/*
+          if-no-files-found: error
+          retention-days: 1
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      RELEASE_TAG: ${{ inputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: assets
+          merge-multiple: true
+      - name: Verify assets and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(find assets -maxdepth 1 -type f | wc -l)" -eq 5
+          (cd assets && sha256sum * | sort -k2 > SHA256SUMS.txt)
+          gh release create "$RELEASE_TAG" assets/* --repo "$GITHUB_REPOSITORY" --title "Offline AI Dataset Studio $RELEASE_TAG" --notes "Unsigned desktop builds from source commit $SOURCE_SHA. Verify SHA256SUMS.txt after downloading. macOS and Windows may display security warnings."

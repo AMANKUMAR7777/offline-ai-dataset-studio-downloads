@@ -1,4 +1,5 @@
 name: Build desktop releases
+
 on:
   workflow_dispatch:
     inputs:
@@ -7,14 +8,17 @@ on:
         required: true
         type: string
       version:
-        description: Release tag, for example v0.1.0
+        description: Release tag, for example v0.2.0
         required: true
         type: string
+
 permissions:
   contents: read
+
 concurrency:
   group: desktop-release
   cancel-in-progress: false
+
 jobs:
   build:
     strategy:
@@ -24,15 +28,19 @@ jobs:
           - os: ubuntu-22.04
             platform: linux
             bundles: deb,appimage
+            ai_target: linux-x64
           - os: windows-latest
             platform: windows
             bundles: nsis
+            ai_target: win-x64
           - os: macos-15
             platform: mac-arm
             bundles: dmg
+            ai_target: osx-arm64
           - os: macos-15-intel
             platform: mac-intel
             bundles: dmg
+            ai_target: osx-x86_64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
@@ -50,6 +58,12 @@ jobs:
         run: |
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+      - name: Free Linux runner disk headroom
+        if: runner.os == 'Linux'
+        working-directory: .
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android || true
+          df -h
       - name: Check out private source (read-only)
         uses: actions/checkout@v4
         with:
@@ -72,7 +86,13 @@ jobs:
           sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf
       - run: pnpm install --frozen-lockfile
       - name: Test core and licenses
-        run: cargo test --locked -p studio-core -p license-core
+        run: |
+          cargo test --locked -p license-core -p studio-core
+          rm -rf target/debug
+      - name: Stage verified offline AI models and ONNX runtime
+        run: |
+          node scripts/prepare-semantic-assets.mjs "${{ matrix.ai_target }}" apps/desktop/src-tauri/resources/ai-assets "${{ runner.temp }}/ai-cache"
+          rm -rf "${{ runner.temp }}/ai-cache"
       - name: Build frontend
         run: pnpm --filter @ods/desktop build
       - name: Build installers
@@ -92,27 +112,30 @@ jobs:
               deb=$(find target/release/bundle -type f -name '*.deb' -print -quit)
               app=$(find target/release/bundle -type f -name '*.AppImage' -print -quit)
               test -n "$deb" && test -n "$app"
-              cp "$deb" "release-assets/ODS_${VERSION}_amd64.deb"
-              cp "$app" "release-assets/ODS_${VERSION}_amd64.AppImage"
+              mv "$deb" "release-assets/ODS_${VERSION}_amd64.deb"
+              mv "$app" "release-assets/ODS_${VERSION}_amd64.AppImage"
               ;;
             windows)
               exe=$(find target/release/bundle -type f -iname '*setup.exe' -print -quit)
               test -n "$exe"
-              cp "$exe" "release-assets/ODS_${VERSION}_x64-setup.exe"
+              mv "$exe" "release-assets/ODS_${VERSION}_x64-setup.exe"
               ;;
             mac-arm|mac-intel)
               dmg=$(find target/release/bundle -type f -name '*.dmg' -print -quit)
               test -n "$dmg"
               if [ "$PLATFORM" = mac-arm ]; then arch=aarch64; else arch=x64; fi
-              cp "$dmg" "release-assets/ODS_${VERSION}_${arch}.dmg"
+              mv "$dmg" "release-assets/ODS_${VERSION}_${arch}.dmg"
               ;;
           esac
+          rm -rf target apps/desktop/src-tauri/resources/ai-assets
+          ls -lh release-assets
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.platform }}
           path: source/release-assets/*
           if-no-files-found: error
           retention-days: 1
+
   publish:
     needs: build
     runs-on: ubuntu-22.04
@@ -123,6 +146,10 @@ jobs:
       SOURCE_SHA: ${{ inputs.source_sha }}
       RELEASE_TAG: ${{ inputs.version }}
     steps:
+      - name: Free Linux runner disk headroom
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android || true
+          df -h
       - uses: actions/download-artifact@v4
         with:
           pattern: release-*
@@ -136,4 +163,5 @@ jobs:
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           test "$(find assets -maxdepth 1 -type f | wc -l)" -eq 5
           (cd assets && sha256sum * | sort -k2 > SHA256SUMS.txt)
-          gh release create "$RELEASE_TAG" assets/* --repo "$GITHUB_REPOSITORY" --title "Offline AI Dataset Studio $RELEASE_TAG" --notes "Unsigned desktop builds from source commit $SOURCE_SHA. Verify SHA256SUMS.txt after downloading. macOS and Windows may display security warnings."
+          ls -lh assets
+          gh release create "$RELEASE_TAG" assets/* --repo "$GITHUB_REPOSITORY" --title "Offline AI Dataset Studio $RELEASE_TAG" --notes "Offline AI Dataset Studio $RELEASE_TAG built from commit $SOURCE_SHA with bundled ONNX Runtime 1.23.2, all-MiniLM-L6-v2, BGE-Base v1.5, BERT-Base NER, offline tokenizers, and embedded Apache DataFusion SQL engine. Verify SHA256SUMS.txt after downloading."

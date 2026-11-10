@@ -39,6 +39,7 @@ jobs:
       ODS_PUBLIC_KEYS: ${{ secrets.ODS_PUBLIC_KEYS }}
       APPLE_SIGNING_IDENTITY: '-'
       SOURCE_SHA: ${{ inputs.source_sha }}
+      RELEASE_TAG: ${{ inputs.version }}
     defaults:
       run:
         shell: bash
@@ -46,7 +47,9 @@ jobs:
     steps:
       - name: Validate source revision
         working-directory: .
-        run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+        run: |
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
       - name: Check out private source (read-only)
         uses: actions/checkout@v4
         with:
@@ -82,25 +85,26 @@ jobs:
         env:
           PLATFORM: ${{ matrix.platform }}
         run: |
+          VERSION="${RELEASE_TAG#v}"
           mkdir -p release-assets
           case "$PLATFORM" in
             linux)
               deb=$(find target/release/bundle -type f -name '*.deb' -print -quit)
               app=$(find target/release/bundle -type f -name '*.AppImage' -print -quit)
               test -n "$deb" && test -n "$app"
-              cp "$deb" release-assets/ODS_0.1.0_amd64.deb
-              cp "$app" release-assets/ODS_0.1.0_amd64.AppImage
+              cp "$deb" "release-assets/ODS_${VERSION}_amd64.deb"
+              cp "$app" "release-assets/ODS_${VERSION}_amd64.AppImage"
               ;;
             windows)
               exe=$(find target/release/bundle -type f -iname '*setup.exe' -print -quit)
               test -n "$exe"
-              cp "$exe" release-assets/ODS_0.1.0_x64-setup.exe
+              cp "$exe" "release-assets/ODS_${VERSION}_x64-setup.exe"
               ;;
             mac-arm|mac-intel)
               dmg=$(find target/release/bundle -type f -name '*.dmg' -print -quit)
               test -n "$dmg"
               if [ "$PLATFORM" = mac-arm ]; then arch=aarch64; else arch=x64; fi
-              cp "$dmg" "release-assets/ODS_0.1.0_${arch}.dmg"
+              cp "$dmg" "release-assets/ODS_${VERSION}_${arch}.dmg"
               ;;
           esac
       - uses: actions/upload-artifact@v4
